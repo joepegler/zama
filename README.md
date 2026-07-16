@@ -1,42 +1,80 @@
 # Confidential token indexer
 
-A small Sepolia service that gives wallets an ERC-20-style view of one ERC-7984
-wrapper. It indexes confidential transfers and shield/unshield activity, decrypts with
-`@zama-fhe/sdk`, retains unresolved amounts, and exposes balance, history, and health
-endpoints.
+Sepolia service that gives wallets an ERC-20-style view of one ERC-7984 wrapper. It
+indexes confidential transfers and shield/unshield activity, decrypts with
+`@zama-fhe/sdk`, and exposes balance, history, and health endpoints.
+
+For architecture decisions, trade-offs, and production notes, see
+[`DECISIONS.md`](DECISIONS.md).
 
 ```text
-Sepolia -> Ponder -> Zama SDK -> Ponder database -> Hono API
+Sepolia events
+  -> Ponder handler: persist row as pending_decryption
+  -> Zama SDK: direct or delegated decrypt attempt
+  -> Ponder database: update same row to decrypted (or leave pending)
+  -> Hono API: cleartext balance, history, health
+        ^
+        ACL delegation + near-head block retries
 ```
-
-Ponder supplies event ordering, persistence, reorg rollback, and API hosting. The code
-adds only the confidential lifecycle: save an event as pending, attempt direct or
-delegated decryption, update the same row, and retry pending rows near chain head.
 
 ## Setup
 
-Requires Node.js 22+, npm 10+, and an archive-capable Sepolia RPC.
+Requirements: Node.js 22+, npm 10+, and (to run the indexer) an archive-capable Sepolia
+RPC URL.
+
+### Environment
+
+Copy the example file, then set `SEPOLIA_RPC_URL`. Everything else has working defaults
+for the bundled Sepolia `cUSDCMock` contract.
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Required for | Default | Purpose |
+| --- | --- | --- | --- |
+| `SEPOLIA_RPC_URL` | `dev`, smoke | — | Archive-capable Sepolia HTTPS RPC |
+| `INDEXER_PRIVATE_KEY` | `dev`, smoke | toy `0x…01` | EOA the Zama SDK uses for decryption |
+| `TOKEN_ADDRESS` | `dev`, smoke | `0x7c5B…3639` | ERC-7984 wrapper to index |
+| `TOKEN_START_BLOCK` | `dev` | `10162159` | First block with wrapper code |
+| `RELAYER_API_KEY` | — | empty | Zama relayer API-key auth, if needed |
+| `ALICE_PK` | smoke only | toy `0x…02` | Funded Sepolia account for live demo |
+
+`npm test` does not read `.env` (in-memory tests only). `npm run build` runs codegen and
+does not start the indexer. `npm run dev` loads `.env` and needs at least
+`SEPOLIA_RPC_URL` plus `INDEXER_PRIVATE_KEY`.
+
+Use toy testnet keys only. Never commit a real `.env`.
+
+### Run (copy-paste)
+
+**Verify without chain access** — clone, install, run unit/integration tests:
 
 ```bash
 npm ci
-cp .env.example .env
-npm run build
 npm test
+```
+
+**Run the indexer** — after setting `SEPOLIA_RPC_URL` in `.env`:
+
+```bash
+npm ci
+cp .env.example .env   # skip if you already have .env
+# Edit .env: set SEPOLIA_RPC_URL=https://your-archive-sepolia-endpoint
+npm run build
 npm run dev
 ```
 
 Ponder serves at `http://localhost:42069`.
 
-Service configuration:
+First run may replay from `TOKEN_START_BLOCK` for several minutes. While catching up,
+`/balances` and `/transfers` return `503`.
 
-- `INDEXER_PRIVATE_KEY`: toy EOA used to sign direct/delegated decrypt requests.
-- `SEPOLIA_RPC_URL`: archive-capable Sepolia endpoint.
-- `TOKEN_ADDRESS`: the single ERC-7984 wrapper.
-- `TOKEN_START_BLOCK`: wrapper deployment block; balances are incomplete if this is
-  wrong.
-- `RELAYER_API_KEY`: optional Zama relayer key.
+```bash
+curl -s "http://localhost:42069/api/health" | jq .
+```
 
-Use toy testnet keys only; never commit a funded or production key.
+Proceed when `behind` is `false` and `status` is `ok`.
 
 ## API
 
@@ -48,45 +86,98 @@ curl "http://localhost:42069/transfers/$ADDRESS"
 curl "http://localhost:42069/api/health"
 ```
 
-Amounts are explicit about uncertainty:
+Pending semantics: if any activity affecting an address is still pending decryption, the
+balance is returned as pending (`{ "state": "pending_decryption", "value": null }`)
+rather than a partial number.
+
+### `GET /balances/:address` (`200`)
 
 ```json
-{ "state": "decrypted", "value": "250" }
+{
+  "address": "0x1111111111111111111111111111111111111111",
+  "token": {
+    "address": "0x7c5bf43b851c1dff1a4fee8db225b87f2c223639",
+    "decimals": 6
+  },
+  "indexedThroughBlock": "9876543",
+  "balance": { "state": "decrypted", "value": "4000000" },
+  "pendingTransfers": 0
+}
 ```
+
+### `GET /transfers/:address` (`200`)
 
 ```json
-{ "state": "pending_decryption", "value": null }
+{
+  "token": {
+    "address": "0x7c5bf43b851c1dff1a4fee8db225b87f2c223639",
+    "decimals": 6
+  },
+  "indexedThroughBlock": "9876543",
+  "data": [
+    {
+      "id": "0xabc...:12",
+      "transactionHash": "0xabc...",
+      "blockNumber": "9876540",
+      "type": "confidential",
+      "from": "0x1111...",
+      "to": "0x2222...",
+      "amount": { "state": "decrypted", "value": "1000000" }
+    },
+    {
+      "id": "0xdef...:4",
+      "transactionHash": "0xdef...",
+      "blockNumber": "9876500",
+      "type": "shield",
+      "from": "0x0000...",
+      "to": "0x1111...",
+      "amount": { "state": "pending_decryption", "value": null }
+    }
+  ]
+}
 ```
 
-If any activity affecting an address is pending, its balance is also pending rather
-than a misleading partial total. History returns the latest 50 activities. Ponder owns
-its built-in `/health`, so `/api/health` is the partner endpoint containing service
-status, indexed block, chain head, lag, and pending count.
+### `GET /api/health`
 
-## Proof
+Ponder owns `/health`; this partner-facing endpoint is `/api/health`.
+
+```json
+{
+  "status": "ok",
+  "behind": false,
+  "indexedBlock": "9876543",
+  "chainHeadBlock": "9876545",
+  "lagBlocks": "2",
+  "pendingDecryptionCount": 0,
+  "oldestPendingBlock": null,
+  "oldestPendingAgeBlocks": null
+}
+```
+
+Returns `200` when ready, `503` when degraded.
+
+## Verify
 
 ```bash
 npm test
 ```
 
-Two focused tests prove:
+### Optional live smoke (Sepolia)
 
-1. shield + confidential event -> decryption -> stored cleartext -> balance/history API;
-2. denied event -> visible pending amount -> later retry -> backfilled cleartext.
+Needs the indexer running plus funded toy `INDEXER_PRIVATE_KEY` and `ALICE_PK` in
+`.env`.
 
-They run the lifecycle and HTTP contract in memory. For the live SDK/Ponder path, start
-the service with funded toy Sepolia keys and run:
+Terminal 1:
+
+```bash
+npm run dev
+# Wait until /api/health reports behind: false
+```
+
+Terminal 2:
 
 ```bash
 npm run smoke:sepolia
 ```
 
-The smoke script mints test USDCMock, shields it, grants the indexer delegation, sends a
-confidential transfer, and checks exact sender and recipient API balances.
-
-## Deliberate limits
-
-Decryption runs inside Ponder, retries are a small block-triggered pass, and delegated
-rights are probed from transfer participants. There is no authentication, queue,
-multi-tenancy, production key management, or observability stack. These are design
-notes in `DECISIONS.md`, not partial infrastructure in this exercise.
+On success, the script prints `Sepolia smoke demo passed.`.
